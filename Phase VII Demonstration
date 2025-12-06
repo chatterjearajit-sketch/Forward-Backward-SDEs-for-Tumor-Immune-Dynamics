@@ -1,0 +1,178 @@
+# phase7_robust_control_demo.py
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.integrate import solve_ivp
+
+# =================================================================
+# 1. Model: Tumor (T) + Effector cells (E)
+# =================================================================
+def tumor_immune_drift(t, x, u, theta):
+    T, E = x
+    r_T, K, delta_TE, beta, gamma, sigma_T, sigma_E = theta
+    dT = r_T * T * (1 - T/K) - delta_TE * T * E
+    dE = beta * u * E - gamma * E
+    return np.array([dT, dE])
+
+def tumor_immune_diffusion(t, x, theta):
+    T, _ = x
+    _, _, _, _, _, sigma_T, sigma_E = theta
+    return np.diag([sigma_T * T, sigma_E * T])
+
+# Costs
+R = 1e-3
+def running_cost(x, u):
+    T, _ = x
+    return T**2 + R * u**2
+
+Q = 100.0
+T_target = 1e8
+def terminal_cost(x):
+    T, _ = x
+    return Q * (T - T_target)**2
+
+# =================================================================
+# 2. Stochastic trajectory simulation (Euler-Maruyama)
+# =================================================================
+def simulate_trajectory(theta, u_const, T_final=60.0, steps=1000, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    dt = T_final / steps
+    sqrt_dt = np.sqrt(dt)
+    X = np.zeros((steps + 1, 2))
+    X[0] = x0
+    for i in range(steps):
+        drift = tumor_immune_drift(0, X[i], u_const, theta)
+        diff = tumor_immune_diffusion(0, X[i], theta)
+        dW = np.random.randn(2) * sqrt_dt
+        X[i+1] = X[i] + drift * dt + diff @ dW
+        X[i+1] = np.maximum(X[i+1], 1e3)        # prevent extinction
+    return X
+
+# =================================================================
+# 3. Nominal optimal control (deterministic approximation)
+# =================================================================
+def solve_nominal_optimal_control(theta):
+    def total_cost(u_const):
+        u = float(u_const[0])
+        def ode(t, x):
+            return tumor_immune_drift(t, x, u, theta)
+        sol = solve_ivp(ode, [0, T_final], x0, method='RK45',
+                        t_eval=np.linspace(0, T_final, 1000))
+        T_traj = sol.y[0]
+        integral = np.trapz(T_traj**2 + R * u**2, sol.t)
+        J = integral + terminal_cost(sol.y[:,-1])
+        return J
+
+    res = minimize(total_cost, x0=[0.5], bounds=[(0, 1)], method='L-BFGS-B', tol=1e-6)
+    return res.x[0]
+
+# =================================================================
+# 4. Uncertainty setup
+# =================================================================
+np.random.seed(42)
+n_scenarios = 200
+T_final = 60.0
+x0 = np.array([1e9, 1e7])                     # initial condition
+
+theta_nom = np.array([0.28, 5e10, 5e-10, 0.4, 0.05, 0.05, 0.1])
+#                    r_T    K     δ_TE    β    γ   σ_T   σ_E
+
+thetas = np.tile(theta_nom, (n_scenarios, 1))
+thetas[:, 0] *= np.random.lognormal(0, 0.15, n_scenarios)   # r_T  ±~20%
+thetas[:, 2] *= np.random.lognormal(0, 0.20, n_scenarios)   # δ_TE
+thetas[:, 3] *= np.random.lognormal(0, 0.18, n_scenarios)   # β
+
+# =================================================================
+# 5. Cost evaluation over all scenarios
+# =================================================================
+def evaluate_cost(u_const, thetas=thetas):
+    costs = []
+    for theta in thetas:
+        traj = simulate_trajectory(theta, u_const, T_final, steps=800)
+        t_grid = np.linspace(0, T_final, len(traj))
+        T_traj = traj[:, 0]
+        integral = np.trapz(T_traj**2 + R * u_const**2, t_grid)
+        J = integral + terminal_cost(traj[-1])
+        costs.append(J)
+    return np.array(costs)
+
+# =================================================================
+# 6. Compute the three strategies
+# =================================================================
+print("Computing nominal control...", end="")
+u_nominal = solve_nominal_optimal_control(theta_nom)
+print(f" → u_nominal = {u_nominal:.3f}")
+
+print("Computing min-max robust control...", end="")
+def worst_case_obj(u_vec):
+    return evaluate_cost(u_vec[0]).max()
+res_robust = minimize(worst_case_obj, x0=[u_nominal], bounds=[(0,1)],
+                      method='L-BFGS-B', tol=1e-6)
+u_robust = res_robust.x[0]
+print(f" → u_robust = {u_robust:.3f}")
+
+print("Computing CVaR-10% robust control...", end="")
+alpha = 0.10
+def cvar_obj(u_vec):
+    costs = evaluate_cost(u_vec[0])
+    costs_sorted = np.sort(costs)
+    idx = int((1 - alpha) * len(costs))
+    return costs_sorted[idx:].mean()
+res_cvar = minimize(cvar_obj, x0=[u_nominal], bounds=[(0,1)],
+                    method='L-BFGS-B', tol=1e-6)
+u_cvar = res_cvar.x[0]
+print(f" → u_CVaR = {u_cvar:.3f}")
+
+# =================================================================
+# 7. Final comparison
+# =================================================================
+strategies = {
+    "Nominal": u_nominal,
+    "Min-Max Robust": u_robust,
+    "CVaR-10% Robust": u_cvar
+}
+
+print("\n" + "="*85)
+print("PHASE VII – ROBUSTNESS COMPARISON (200 uncertain scenarios)")
+print("="*85)
+print(f"{'Strategy':<18} {'Mean Cost':>12} {'Worst Cost':>12} {'CVaR-10%':>12} {'Failure Rate':>14} {'Dose':>8}")
+print("-"*85)
+
+for name, u in strategies.items():
+    costs = evaluate_cost(u)
+    terminal_T = [simulate_trajectory(th, u, seed=None)[-1,0] for th in thetas]
+    mean_cost = costs.mean() / 1e10
+    worst_cost = costs.max() / 1e10
+    cvar10 = np.sort(costs)[int(0.9*n_scenarios):].mean() / 1e10
+    failure = 100 * np.mean(np.array(terminal_T) > 5e10)
+    print(f"{name:<18} {mean_cost:12.2f} {worst_cost:12.2f} {cvar10:12.2f} {failure:11.1f}% {u:8.3f}")
+print("-"*85)
+
+# =================================================================
+# 8. Plot 30 random trajectories
+# =================================================================
+plt.figure(figsize=(11, 6.5))
+t_grid = np.linspace(0, T_final, 801)
+colors = {"Nominal": "#1f77b4", "Min-Max Robust": "#d62728", "CVaR-10% Robust": "#2ca02c"}
+
+for i in range(30):
+    idx = np.random.randint(n_scenarios)
+    theta = thetas[idx]
+    for name, u in strategies.items():
+        traj = simulate_trajectory(theta, u, T_final, steps=800, seed=100+i)
+        label = name if i == 0 else None
+        plt.plot(t_grid, traj[:,0]/1e9, color=colors[name], alpha=0.25, lw=1.2, label=label)
+
+plt.axhline(50, color='black', linestyle='--', linewidth=1.5, label='Failure threshold (5×10¹⁰)')
+plt.yscale('log')
+plt.ylim(0.5, 5e3)
+plt.xlabel('Time (days)', fontsize=12)
+plt.ylabel('Tumor volume (×10⁹ cells)', fontsize=12)
+plt.title('Phase VII Demo – Robust vs Nominal Control under Parameter Uncertainty', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
